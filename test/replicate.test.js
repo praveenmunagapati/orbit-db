@@ -3,103 +3,89 @@
 const assert = require('assert')
 const mapSeries = require('p-each-series')
 const rmrf = require('rimraf')
-const IPFS = require('ipfs')
 const OrbitDB = require('../src/OrbitDB')
 const config = require('./config')
-const hasIpfsApiWithPubsub = require('./test-utils').hasIpfsApiWithPubsub
+const startIpfs = require('./start-ipfs')
+const waitForPeers = require('./wait-for-peers')
 
 const dbPath1 = './orbitdb/tests/replication/daemon1'
 const dbPath2 = './orbitdb/tests/replication/daemon2'
 const ipfsPath1 = './orbitdb/tests/replication/daemon1/ipfs'
 const ipfsPath2 = './orbitdb/tests/replication/daemon2/ipfs'
 
-const waitForPeers = (ipfs, channel) => {
-  return new Promise((resolve, reject) => {
-    console.log("Waiting for peers...")
-    const interval = setInterval(() => {
-      ipfs.pubsub.peers(channel)
-        .then((peers) => {
-          if (peers.length > 0) {
-            console.log("Found peers, running tests...")
-            clearInterval(interval)
-            resolve()
-          }
-        })
-        .catch((e) => {
-          clearInterval(interval)
-          reject(e)
-        })
-    }, 1000)
-  })
-}
-
 describe('orbit-db - Replication', function() {
   this.timeout(config.timeout)
 
-  let ipfs1, ipfs2, client1, client2, db1, db2
+  let ipfs1, ipfs2, orbitdb1, orbitdb2, db1, db2
 
-  before(function (done) {
+  before(async () => {
     config.daemon1.repo = ipfsPath1
     config.daemon2.repo = ipfsPath2
+    rmrf.sync(config.daemon1.repo)
+    rmrf.sync(config.daemon2.repo)
     rmrf.sync(dbPath1)
     rmrf.sync(dbPath2)
-    ipfs1 = new IPFS(config.daemon1)
-    ipfs1.on('error', done)
-    ipfs1.on('ready', () => {
-      assert.equal(hasIpfsApiWithPubsub(ipfs1), true)
-      ipfs2 = new IPFS(config.daemon2)
-      ipfs2.on('error', done)
-      ipfs2.on('ready', () => {
-        assert.equal(hasIpfsApiWithPubsub(ipfs2), true)
-        client1 = new OrbitDB(ipfs1)
-        client2 = new OrbitDB(ipfs2)
-        done()
-      })
-    })
+    ipfs1 = await startIpfs(config.daemon1)
+    ipfs2 = await startIpfs(config.daemon2)
+    orbitdb1 = new OrbitDB(ipfs1, dbPath1)
+    orbitdb2 = new OrbitDB(ipfs2, dbPath2)
   })
 
   after(() => {
-    if (client1)
-      client1.disconnect()
-    
-    if (client2)
-      client2.disconnect()
-    
-    if (ipfs1) 
+    if(orbitdb1) 
+      orbitdb1.disconnect()
+
+    if(orbitdb2) 
+      orbitdb2.disconnect()
+
+    if (ipfs1)
       ipfs1.stop()
 
-    if (ipfs2) 
+    if (ipfs2)
       ipfs2.stop()
   })
 
   describe('two peers', function() {
-    beforeEach(() => {
-      db1 = client1.eventlog(config.dbname, { 
-        path: dbPath1
-      })
+    beforeEach(async () => {
+      let options = { 
+        // Set write access for both clients
+        write: [
+          orbitdb1.key.getPublic('hex'), 
+          orbitdb2.key.getPublic('hex')
+        ],
+      }
 
-      db2 = client2.eventlog(db1.path, { 
-        path: dbPath2
+      options = Object.assign({}, options, { path: dbPath1 })
+      db1 = await orbitdb1.eventlog('replication tests', options)
+      // Set 'sync' flag on. It'll prevent creating a new local database and rather
+      // fetch the database from the network
+      options = Object.assign({}, options, { path: dbPath2, sync: true })
+      db2 = await orbitdb2.eventlog(db1.address.toString(), options)
+
+      assert.equal(db1.address.toString(), db2.address.toString())
+
+      await waitForPeers(ipfs1, [orbitdb2.id], db1.address.toString())
+      await waitForPeers(ipfs2, [orbitdb1.id], db1.address.toString())
+    })
+
+    afterEach(async () => {
+      await db1.drop()
+      await db2.drop()
+    })
+
+    it('replicates database of 1 entry', async () => {
+      await db1.add('hello')
+      return new Promise(resolve => {
+        setTimeout(() => {
+          const items = db2.iterator().collect()
+          assert.equal(items.length, 1)
+          assert.equal(items[0].payload.value, 'hello')
+          resolve()
+        }, 1000)
       })
     })
 
-    it('replicates database of 1 entry', (done) => {
-      waitForPeers(ipfs1, db1.path)
-        .then(() => {
-          db2.events.once('error', done)
-          db2.events.once('synced', () => {
-            const items = db2.iterator().collect()
-            assert.equal(items.length, 1)
-            assert.equal(items[0].payload.value, 'hello')
-            done()
-          })
-          db1.add('hello')
-          .catch(done)
-        })
-        .catch(done)
-    })
-
-    it('replicates database of 100 entries', (done) => {
+    it('replicates database of 100 entries', async () => {
       const entryCount = 100
       const entryArr = []
       let timer
@@ -107,31 +93,20 @@ describe('orbit-db - Replication', function() {
       for (let i = 0; i < entryCount; i ++)
         entryArr.push(i)
 
-      waitForPeers(ipfs1, db1.path)
-        .then(() => {
-          let count = 0
-          db2.events.once('error', done)
-          db2.events.on('synced', () => {
-            if (count === entryCount && !timer) {
-              timer = setInterval(() => {
-                const items = db2.iterator({ limit: -1 }).collect()
-                if (items.length === count) {
-                  clearInterval(timer)
-                  assert.equal(items.length, entryCount)
-                  assert.equal(items[0].payload.value, 'hello0')
-                  assert.equal(items[items.length - 1].payload.value, 'hello99')
-                  setTimeout(done, 5000)
-                }
-              }, 1000)
-            }
-          })
+      await mapSeries(entryArr, (i) => db1.add('hello' + i))
 
-          db1.events.on('write', () => count++)
-
-          mapSeries(entryArr, (i) => db1.add('hello' + i))
-            .catch(done)
-        })
-        .catch(done)
+      return new Promise(resolve => {
+        timer = setInterval(() => {
+          const items = db2.iterator({ limit: -1 }).collect()
+          if (items.length === entryCount) {
+            clearInterval(timer)
+            assert.equal(items.length, entryCount)
+            assert.equal(items[0].payload.value, 'hello0')
+            assert.equal(items[items.length - 1].payload.value, 'hello99')
+            resolve()
+          }
+        }, 1000)
+      })
     })
   })
 })

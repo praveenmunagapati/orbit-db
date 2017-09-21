@@ -3,10 +3,9 @@
 const assert = require('assert')
 const mapSeries = require('p-map-series')
 const rmrf = require('rimraf')
-const hasIpfsApiWithPubsub = require('./test-utils').hasIpfsApiWithPubsub
-const IPFS = require('ipfs')
 const OrbitDB = require('../src/OrbitDB')
 const config = require('./config')
+const startIpfs = require('./start-ipfs')
 
 const dbPath = './orbitdb/tests/persistency'
 const ipfsPath = './orbitdb/tests/persistency/ipfs'
@@ -14,29 +13,25 @@ const ipfsPath = './orbitdb/tests/persistency/ipfs'
 describe('orbit-db - Persistency', function() {
   this.timeout(config.timeout)
 
-  let ipfs, client
+  let ipfs, orbitdb1
 
-  before(function (done) {
+  before(async () => {
     config.daemon1.repo = ipfsPath
+    rmrf.sync(config.daemon1.repo)
     rmrf.sync(dbPath)
-    ipfs = new IPFS(config.daemon1)
-    ipfs.on('error', done)
-    ipfs.on('ready', () => {
-      client = new OrbitDB(ipfs)
-      assert.equal(hasIpfsApiWithPubsub(ipfs), true)
-      done()
-    })
+    ipfs = await startIpfs(config.daemon1)
+    orbitdb1 = new OrbitDB(ipfs, dbPath + '/1')
   })
 
   after(() => {
-    if (client)
-      client.disconnect()
+    if(orbitdb1) 
+      orbitdb1.disconnect()
 
     ipfs.stop()
   })
 
   describe('load', function() {
-    it('loads database from local cache', function(done) {
+    it('loads database from local cache', async () => {
       const dbName = new Date().getTime().toString()
       const entryCount = 100
       const entryArr = []
@@ -45,40 +40,59 @@ describe('orbit-db - Persistency', function() {
         entryArr.push(i)
 
       const options = {
-        // replicate: false,
-        // maxHistory: -1,
         path: dbPath,
       }
 
-      let db = client.eventlog(dbName, options)
+      let db, address
 
-      db.events.on('error', done)
-      db.load().then(function () {
-        mapSeries(entryArr, (i) => db.add('hello' + i))
-          .then(() => {
-            db.close()
-            return new Promise(resolve => setTimeout(() => resolve(), 1000))
-          })
-          .then(() => {
-            db = null
-            db = client.eventlog(dbName, options)
-            db.events.on('error', done)
-            db.events.on('ready', () => {
-              try {
-                const items = db.iterator({ limit: -1 }).collect()
-                assert.equal(items.length, entryCount)
-                assert.equal(items[0].payload.value, 'hello0')
-                assert.equal(items[entryCount - 1].payload.value, 'hello99')
-                done()
-              } catch(e) {
-                done(e)
-              }
-            })
-            db.load()
-              .catch(done)
-          })
-          .catch(done)
-      }).catch(done)
+      db = await orbitdb1.eventlog(dbName)
+      address = db.address
+      await mapSeries(entryArr, (i) => db.add('hello' + i))
+      await db.close()
+      db = null
+
+      db = await orbitdb1.eventlog(address)
+      await db.load()
+
+      const items = db.iterator({ limit: -1 }).collect()
+      assert.equal(items.length, entryCount)
+      assert.equal(items[0].payload.value, 'hello0')
+      assert.equal(items[entryCount - 1].payload.value, 'hello99')
+    })
+
+    it('loading a database emits \'ready\' event', async () => {
+      const dbName = new Date().getTime().toString()
+      const entryCount = 100
+      const entryArr = []
+
+      for (let i = 0; i < entryCount; i ++)
+        entryArr.push(i)
+
+      const options = {
+        path: dbPath,
+      }
+
+      let db, address
+
+      db = await orbitdb1.eventlog(dbName)
+      address = db.address
+
+      await mapSeries(entryArr, (i) => db.add('hello' + i))
+      await db.close()
+
+      db = null
+      db = await orbitdb1.eventlog(address)
+      await db.load()
+
+      const items = db.iterator({ limit: -1 }).collect()
+      assert.equal(items.length, entryCount)
+      assert.equal(items[0].payload.value, 'hello0')
+      assert.equal(items[entryCount - 1].payload.value, 'hello99')
+    })
+  })
+
+  describe('load from snapshot', function() {
+    it.skip('loads database from snapshot', async (done) => {
     })
   })
 })

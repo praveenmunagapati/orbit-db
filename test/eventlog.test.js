@@ -4,11 +4,10 @@ const assert = require('assert')
 const rmrf = require('rimraf')
 const mapSeries = require('p-map-series')
 const OrbitDB = require('../src/OrbitDB')
-const hasIpfsApiWithPubsub = require('./test-utils').hasIpfsApiWithPubsub
 const first = require('./test-utils').first
 const last = require('./test-utils').last
 const config = require('./config')
-const IPFS = require('ipfs')
+const startIpfs = require('./start-ipfs')
 
 const dbPath = './orbitdb/tests/eventlog'
 const ipfsPath = './orbitdb/tests/eventlog/ipfs'
@@ -16,73 +15,71 @@ const ipfsPath = './orbitdb/tests/eventlog/ipfs'
 describe('orbit-db - Eventlog', function() {
   this.timeout(config.timeout)
 
-  let ipfs, client1, client2, db
+  let ipfs, orbitdb1, orbitdb2, db
 
-  before(function (done) {
+  before(async () => {
     config.daemon1.repo = ipfsPath
     rmrf.sync(config.daemon1.repo)
-    ipfs = new IPFS(config.daemon1)
-    ipfs.on('error', done)
-    ipfs.on('ready', () => {
-      assert.equal(hasIpfsApiWithPubsub(ipfs), true)
-      client1 = new OrbitDB(ipfs)
-      client2 = new OrbitDB(ipfs)
-      done()
-    })
+    rmrf.sync(dbPath)
+    ipfs = await startIpfs(config.daemon1)
+    orbitdb1 = new OrbitDB(ipfs, dbPath + '/1')
+    orbitdb2 = new OrbitDB(ipfs, dbPath + '/2')
   })
 
   after(() => {
-    if(client1) client1.disconnect()
-    if(client2) client2.disconnect()
+    if(orbitdb1) 
+      orbitdb1.disconnect()
+
+    if(orbitdb2) 
+      orbitdb2.disconnect()
+
     ipfs.stop()
   })
 
-  describe('Eventlog', function() {
-    it('returns the added entry\'s hash, 1 entry', () => {
-      db = client1.eventlog(config.dbname, { replicate: false, maxHistory: 0 })
-      return db.add('hello1')
-        .then((hash) => {
-          const items = db.iterator({ limit: -1 }).collect()
-          assert.notEqual(hash, null)
-          assert.equal(hash, last(items).hash)
-          assert.equal(items.length, 1)
-        })
+  describe('Eventlog', function () {
+    it('creates and opens a database', async () => {
+      db = await orbitdb1.eventlog('first database')
+      db = await orbitdb1.eventlog('first database')
+      const items = db.iterator({ limit: -1 }).collect()
+      assert.equal(items.length, 0)
     })
 
-    it('returns the added entry\'s hash, 2 entries', () => {
+    it('returns the added entry\'s hash, 1 entry', async () => {
+      db = await orbitdb1.eventlog('first database')
+      const hash = await db.add('hello1')
+      const items = db.iterator({ limit: -1 }).collect()
+      assert.notEqual(hash, null)
+      assert.equal(hash, last(items).hash)
+      assert.equal(items.length, 1)
+    })
+
+    it('returns the added entry\'s hash, 2 entries', async () => {
       const prevHash = db.iterator().collect()[0].hash
-      return db.add('hello2')
-        .then((hash) => {
-          const items = db.iterator({ limit: -1 }).collect()
-          assert.equal(items.length, 2)
-          assert.notEqual(hash, null)
-          assert.notEqual(hash, prevHash)
-          assert.equal(hash, last(items).hash)
-        })
+      const hash = await db.add('hello2')
+      const items = db.iterator({ limit: -1 }).collect()
+      assert.equal(items.length, 2)
+      assert.notEqual(hash, null)
+      assert.notEqual(hash, prevHash)
+      assert.equal(hash, last(items).hash)
     })
 
-    it('adds five items', () => {
-      db = client1.eventlog(config.dbname, { replicate: false, maxHistory: 0 })
-      return mapSeries([1, 2, 3, 4, 5], (i) => db.add('hello' + i))
-        .then(() => {
-          const items = db.iterator({ limit: -1 }).collect()
-          assert.equal(items.length, 5)
-          assert.equal(first(items.map((f) => f.payload.value)), 'hello1')
-          assert.equal(last(items.map((f) => f.payload.value)), 'hello5')
-        })
+    it('adds five items', async () => {
+      db = await orbitdb1.eventlog('second database')
+      await mapSeries([1, 2, 3, 4, 5], (i) => db.add('hello' + i))
+      const items = db.iterator({ limit: -1 }).collect()
+      assert.equal(items.length, 5)
+      assert.equal(first(items.map((f) => f.payload.value)), 'hello1')
+      assert.equal(last(items.map((f) => f.payload.value)), 'hello5')
     })
 
-    it('adds an item that is > 256 bytes', () => {
-      db = client1.eventlog(config.dbname, { replicate: false, maxHistory: 0 })
-
+    it('adds an item that is > 256 bytes', async () => {
+      db = await orbitdb1.eventlog('third database')
       let msg = new Buffer(1024)
       msg.fill('a')
-      return db.add(msg.toString())
-        .then((hash) => {
-          assert.notEqual(hash, null)
-          assert.equal(hash.startsWith('Qm'), true)
-          assert.equal(hash.length, 46)
-        })
+      const hash = await db.add(msg.toString())
+      assert.notEqual(hash, null)
+      assert.equal(hash.startsWith('Qm'), true)
+      assert.equal(hash.length, 46)
     })
   })
 
@@ -90,11 +87,10 @@ describe('orbit-db - Eventlog', function() {
     let items = []
     const itemCount = 5
 
-    beforeEach(() => {
+    before(async () => {
       items = []
-      db = client1.eventlog(config.dbname, { replicate: false, maxHistory: 0 })
-      return mapSeries([0, 1, 2, 3, 4], (i) => db.add('hello' + i))
-        .then((res) => items = res)
+      db = await orbitdb1.eventlog('iterator tests')
+      items = await mapSeries([0, 1, 2, 3, 4], (i) => db.add('hello' + i))
     })
 
     describe('Defaults', function() {
@@ -350,37 +346,6 @@ describe('orbit-db - Eventlog', function() {
           assert.equal(messages[2], last(items))
         })
       })
-    })
-  })
-
-  describe('sync', () => {
-    const options = { 
-      replicate: false,
-    }
-
-    it('syncs databases', (done) => {
-      const db1 = client1.eventlog(config.dbname, options)
-      const db2 = client2.eventlog(config.dbname, options)
-
-      db1.events.on('error', (e) => {
-        console.log(e.stack())
-        done(e)
-      })
-
-      db2.events.on('write', (dbname, hash, entry, heads) => {
-        assert.equal(db1.iterator({ limit: -1 }).collect().length, 0)
-        db1.sync(heads)
-      })
-
-      db1.events.on('synced', () => {
-        const items = db1.iterator({ limit: -1 }).collect()
-        assert.equal(items.length, 1)
-        assert.equal(items[0].payload.value, 'hello2')
-        done()
-      })
-
-      db2.add('hello2')
-        .catch(done)
     })
   })
 })
